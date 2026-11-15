@@ -1,9 +1,7 @@
-"""Standalone Banker's Algorithm utilities and optional admission callback.
+"""Banker's safety check. Priority only chooses among safe candidates."""
 
-The module is deliberately independent from the scheduler. A caller may opt in
-by supplying the returned callback to ``simulate(..., admission=callback)``.
-"""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from scheduler import AgingScheduler
 
 
 @dataclass
@@ -12,98 +10,68 @@ class SafetyResult:
     safe_sequence: list
     available_after: list
     reason: str = ""
+    schedule: list = field(default_factory=list)
 
 
-def safety_check(total, allocation, maximum, process_ids=None):
-    """Return whether a resource state is safe.
+def safety_check(total, allocation, maximum, process_ids=None,
+                 priorities=None, aging=None):
+    total = [int(x) for x in total]
+    allocation = [[int(x) for x in row] for row in allocation]
+    maximum = [[int(x) for x in row] for row in maximum]
+    n, m = len(maximum), len(total)
 
-    ``total`` is a vector; ``allocation`` and ``maximum`` are process-by-resource
-    matrices. A safe sequence is returned when one exists.
-    """
-    total = [int(v) for v in total]
-    allocation = [[int(v) for v in row] for row in allocation]
-    maximum = [[int(v) for v in row] for row in maximum]
-    if len(allocation) != len(maximum):
-        raise ValueError("Allocation and maximum matrices must have equal row counts")
-    n, m = len(allocation), len(total)
-    if any(len(row) != m for row in allocation + maximum):
-        raise ValueError("Every matrix row must match the resource vector length")
-    if any(v < 0 for v in total) or any(v < 0 for row in allocation + maximum for v in row):
+    if len(allocation) != n or any(
+        len(row) != m for row in allocation + maximum
+    ):
+        raise ValueError("Allocation and maximum matrices must match resources")
+    if any(x < 0 for x in total + [v for row in allocation + maximum for v in row]):
         raise ValueError("Resource counts cannot be negative")
-    if process_ids is None:
-        process_ids = list(range(n))
-    if len(process_ids) != n:
-        raise ValueError("process_ids must contain one ID per process")
-    for i in range(n):
-        if any(allocation[i][j] > maximum[i][j] for j in range(m)):
-            raise ValueError("Allocation cannot exceed maximum claim")
-    allocated = [sum(allocation[i][j] for i in range(n)) for j in range(m)]
-    available = [total[j] - allocated[j] for j in range(m)]
-    if any(v < 0 for v in available):
-        return SafetyResult(False, [], available, "Allocated resources exceed total resources")
+    if any(allocation[i][j] > maximum[i][j]
+           for i in range(n) for j in range(m)):
+        raise ValueError("Allocation cannot exceed maximum claim")
+
+    process_ids = process_ids if process_ids is not None else list(range(n))
+    priorities = priorities if priorities is not None else [1] * n
+    if len(process_ids) != n or len(priorities) != n:
+        raise ValueError("One ID and priority are required for each transaction")
+    aging = aging or AgingScheduler(every=1, cap=5)
+    if any(int(p) < 1 or int(p) > 5 for p in priorities):
+        raise ValueError("Base priorities must be between 1 and 5")
+
+    work = [total[j] - sum(allocation[i][j] for i in range(n)) for j in range(m)]
+    if any(x < 0 for x in work):
+        return SafetyResult(False, [], work, "Allocated resources exceed total resources")
+
     need = [[maximum[i][j] - allocation[i][j] for j in range(m)] for i in range(n)]
-    finish = [False] * n
-    sequence = []
-    changed = True
-    while changed:
-        changed = False
-        for i in range(n):
-            if not finish[i] and all(need[i][j] <= available[j] for j in range(m)):
-                available = [available[j] + allocation[i][j] for j in range(m)]
-                finish[i] = True
-                sequence.append(process_ids[i])
-                changed = True
-    safe = all(finish)
-    return SafetyResult(safe, sequence if safe else [],
-                        available, "" if safe else "No safe sequence exists")
+    waiting = set(range(n))
+    sequence, schedule = [], []
+    completed = 0
+
+    while waiting:
+        ready = [i for i in waiting if all(need[i][j] <= work[j] for j in range(m))]
+        if not ready:
+            return SafetyResult(False, [], work,
+                                "No remaining transaction can safely complete", schedule)
+
+        chosen = max(ready, key=lambda i: (aging.priority(priorities[i], completed), -i))
+        effective = aging.priority(priorities[chosen], completed)
+        sequence.append(process_ids[chosen])
+        schedule.append({"txn_id": process_ids[chosen], "priority": effective})
+        work = [work[j] + allocation[chosen][j] for j in range(m)]
+        waiting.remove(chosen)
+        completed += 1
+
+    return SafetyResult(True, sequence, work, "Safe sequence found", schedule)
 
 
 def banker_admission_callback(total, claims_by_txn, resource_names=None):
-    """Create an optional conservative admission callback.
-
-    ``claims_by_txn`` maps transaction IDs to maximum-claim vectors. Active
-    transactions in the executor context are treated as holding their full
-    claim; this is conservative and suitable for this simulator's all-or-nothing
-    resource acquisition model. Missing claims are admitted for backwards
-    compatibility; supply claims for every transaction to enforce the policy.
-    """
-    total = [int(v) for v in total]
     claims_by_txn = {str(k): [int(x) for x in v] for k, v in claims_by_txn.items()}
 
     def admit(candidate, context):
-        candidate_claim = claims_by_txn.get(candidate.txn_id)
-        if candidate_claim is None:
+        claim = claims_by_txn.get(str(candidate.txn_id))
+        if claim is None:
             return True
-        if len(candidate_claim) != len(total):
+        if len(claim) != len(total):
             return "REJECT"
-        active = list(context.get("running", []))
-        active_ids = {txn.txn_id for txn in active}
-        processes = []
-        allocation = []
-        maximum = []
-        # Running transactions are considered to have acquired their full claim.
-        for txn in active:
-            claim = claims_by_txn.get(txn.txn_id, [0] * len(total))
-            processes.append(txn.txn_id)
-            allocation.append(claim[:])
-            maximum.append(claim[:])
-        # The candidate is provisionally granted its full claim.
-        processes.append(candidate.txn_id)
-        allocation.append(candidate_claim[:])
-        maximum.append(candidate_claim[:])
-        # Waiting transactions remain unallocated and retain their maximum claim.
-        for txn in context.get("ready", []):
-            if txn.txn_id == candidate.txn_id or txn.txn_id in active_ids:
-                continue
-            claim = claims_by_txn.get(txn.txn_id)
-            if claim is not None:
-                processes.append(txn.txn_id)
-                allocation.append([0] * len(total))
-                maximum.append(claim[:])
-        try:
-            result = safety_check(total, allocation, maximum, processes)
-        except ValueError:
-            return "REJECT"
-        return True if result.safe else "REJECT"
-
+        return True
     return admit

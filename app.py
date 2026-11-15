@@ -1,338 +1,882 @@
-"""Streamlit front-end:  streamlit run app.py"""
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import pandas as pd
+
 import streamlit as st
+import pandas as pd
 from dotenv import load_dotenv
 
-from executor import simulate
-from generator import (DEFAULT_MIX, PRIORITY_PRESETS, generate_starvation,
-                       generate_workload)
-from metrics import compute_metrics
-from models import REQUEST_FIELDS, TXN_TYPES
 from repository import OracleRepository
-from scheduler import AgingConfig, Policy, Scheduler
+from scheduler import AgingScheduler
+from executor import run_transactions
+from generator import generate_workload
 
-st.set_page_config(page_title="Priority Scheduler Simulator", layout="wide")
-load_dotenv()  # Load local Oracle settings without committing credentials to source control.
+
+# =====================================================
+# 1. PAGE CONFIGURATION
+# =====================================================
+
+load_dotenv()
+
+st.set_page_config(
+    page_title="Bank Transaction Manager",
+    page_icon="🏦",
+    layout="wide"
+)
+
+
+# =====================================================
+# 2. FRONTEND DESIGN
+# =====================================================
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+.stApp {
+    background: linear-gradient(135deg, #edf4ff, #f5f9ff, #e9f7f7);
+    font-family: 'Inter', sans-serif;
+    color: #19324d;
+}
+
+.block-container {
+    max-width: 1150px;
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
+
+h1, h2, h3 {
+    color: #19345a !important;
+    font-weight: 700 !important;
+}
+
+.hero {
+    background: linear-gradient(110deg, #173b68, #087e8b);
+    color: white;
+    padding: 27px 30px;
+    border-radius: 18px;
+    margin-bottom: 25px;
+    box-shadow: 0 8px 22px rgba(23,59,104,0.15);
+}
+
+.hero h1 {
+    color: white !important;
+    font-size: 32px;
+    margin: 0;
+}
+
+.hero p {
+    color: #d9edff;
+    margin: 8px 0 0 0;
+    font-size: 14px;
+}
+
+.section-label {
+    color: #087e8b;
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    margin-bottom: 5px;
+}
+
+.field-label {
+    color: #173b68 !important;
+    font-size: 14px;
+    font-weight: 700;
+    margin: 12px 0 6px 0;
+}
+
+div[data-testid="stWidgetLabel"] p {
+    color: #173b68 !important;
+    font-weight: 700 !important;
+}
+
+div[data-baseweb="select"] > div {
+    background-color: white !important;
+    border: 1px solid #c5d7e9 !important;
+    border-radius: 9px !important;
+    color: #19324d !important;
+}
+
+div[data-baseweb="input"] input {
+    background-color: white !important;
+    border: 1px solid #c5d7e9 !important;
+    border-radius: 9px !important;
+    color: #19324d !important;
+}
+
+div[data-baseweb="select"] span {
+    color: #19324d !important;
+}
+
+.stButton > button,
+.stFormSubmitButton > button {
+    background: linear-gradient(100deg, #087e8b, #0799a5);
+    color: white !important;
+    border: none;
+    border-radius: 10px;
+    padding: 11px 16px;
+    font-weight: 700;
+}
+
+.stButton > button:hover,
+.stFormSubmitButton > button:hover {
+    background: linear-gradient(100deg, #066773, #087e8b);
+    box-shadow: 0 5px 12px rgba(8,126,139,0.2);
+}
+
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background: rgba(255,255,255,0.95);
+    border: 1px solid #d5e3f1;
+    border-radius: 16px;
+    box-shadow: 0 5px 16px rgba(30,70,110,0.05);
+    padding: 10px;
+}
+
+div[data-testid="stMetric"] {
+    background: white;
+    border: 1px solid #d5e3f1;
+    border-radius: 12px;
+    padding: 15px;
+}
+
+div[data-testid="stDataFrame"] {
+    border: 1px solid #d5e3f1;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+hr {
+    border-color: #d5e3f1;
+}
+
+div[data-testid="stAlert"] {
+    border-radius: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# =====================================================
+# 3. HEADER
+# =====================================================
+
+st.markdown("""
+<div class="hero">
+    <h1>🏦 Bank Transaction Manager</h1>
+    <p>
+        Manage banking transactions, generate test workloads
+        and execute transactions using Banker's Algorithm.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# =====================================================
+# 4. DATABASE CONNECTION
+# =====================================================
+
 try:
     repo = OracleRepository()
+    accounts = repo.load_accounts()
+
 except Exception as exc:
-    st.error(f"Oracle database connection failed: {exc}")
-    st.info("Configure ORACLE_USER, ORACLE_PASSWORD, and ORACLE_DSN in your .env file, then run the SQL setup script.")
+    st.error(f"Oracle connection failed: {exc}")
     st.stop()
 
-POLICY_LABELS = {Policy.FIFO: "FIFO (baseline)", Policy.PRIORITY: "Priority (no aging)",
-                 Policy.PRIORITY_AGING: "Priority + Aging"}
+if not accounts:
+    st.warning("No accounts found in the database.")
+    st.stop()
 
-# ---------------- sidebar: scheduler configuration ----------------
-st.sidebar.header("Scheduler settings")
-policy = st.sidebar.selectbox("Policy", list(Policy), index=2, format_func=POLICY_LABELS.get)
-workers = st.sidebar.number_input("Workers (parallel executors)", 1, 8, 2)
-st.sidebar.caption("Use 1 worker to see priority/aging effect most clearly.")
-aging = AgingConfig(
-    interval=st.sidebar.number_input("Aging interval (ticks)", 1, 100, 5),
-    step=st.sidebar.number_input("Aging step (+priority)", 1, 4, 1),
-    cap=st.sidebar.slider("Aging cap (max effective priority)", 1, 5, 5),
-)
-starve_thr = st.sidebar.number_input("Starvation threshold (ticks waited)", 1, 500, 20)
-use_banker = st.sidebar.checkbox(
-    "Enable Banker's safety admission", value=False,
-    help="Optional. Uses Oracle resource claims and ACCOUNT_RESOURCE claims. Off by default to preserve the existing scheduling behaviour."
-)
-st.sidebar.caption("Priority 5 = highest, 1 = lowest. Scheduling is non-preemptive. "
-                   "Time is a logical clock (ticks).")
+account_ids = list(accounts)
 
-st.title("Priority Scheduler + Aging: Banking Transaction Simulator")
-st.caption("Flow: Streamlit -> Oracle DBMS -> Priority Scheduler + Aging -> Execution simulator "
-           "(locks / queued / blocked / unblocked / running / completed)")
-
-tab_req, tab_run, tab_cmp, tab_acc = st.tabs(
-    ["1. Requests", "2. Run scheduler", "3. Compare policies", "Oracle records"])
+scheduler = AgingScheduler(every=1, cap=5)
 
 
-def requests_df():
-    reqs = repo.load_requests()
-    return pd.DataFrame([t.to_row_request() for t in reqs], columns=REQUEST_FIELDS)
+# =====================================================
+# 5. SESSION TRACKING
+# =====================================================
+
+# Store IDs of transactions created during this app session.
+
+if "new_txn_ids" not in st.session_state:
+    st.session_state["new_txn_ids"] = []
+
+if "last_sequence" not in st.session_state:
+    st.session_state["last_sequence"] = ""
+
+if "last_generated_mix" not in st.session_state:
+    st.session_state["last_generated_mix"] = {}
 
 
-# ---------------- tab 1: requests ----------------
-with tab_req:
-    accounts = repo.load_accounts()
-    ids = sorted(accounts)
-    st.subheader("Generate concurrent workload")
-    st.caption("This project demonstrates concurrent arrivals through a workload batch; individual one-by-one submission controls are hidden.")
-    left, right = st.columns(2)
+def remember_new_transactions(items):
+    """Remember newly created transaction IDs."""
 
-    with left:
-        st.subheader("Concurrent workload settings")
-        n = st.number_input("Number of requests", 1, 500, 10)
-        mc = st.columns(4)
-        mix = {k: mc[i].number_input(k.title(), 0, 100, int(DEFAULT_MIX[k] * 100))
-               for i, k in enumerate(DEFAULT_MIX)}
-        pc, ac, sc = st.columns(3)
-        preset = pc.selectbox("Priority distribution", list(PRIORITY_PRESETS))
-        arrival_mode = ac.selectbox("Arrival pattern", ["burst", "staggered"])
-        seed = sc.number_input("Seed", 0, 10_000, 42)
-        if st.button("Generate (async submit)"):
-            if sum(mix.values()) == 0:
-                st.error("Mix cannot be all zeros")
-            else:
-                made = generate_workload(repo, n, mix, PRIORITY_PRESETS[preset], arrival_mode, seed)
-                st.success(f"Submitted {len(made)} requests concurrently")
-        st.markdown("**Starvation demo preset**: 1 low-priority request among a stream of "
-                    "high-priority ones. Run with 1 worker.")
-        if st.button("Add starvation scenario"):
-            made = generate_starvation(repo)
-            st.success(f"Added {len(made)} requests (low-priority one is LOW-1)")
-        if st.button("Clear pending requests"):
-            repo.clear_requests()
-            st.session_state.pop("result", None)
-            st.rerun()
+    ids = st.session_state["new_txn_ids"]
 
-    st.subheader("Request queue (loaded from Oracle)")
-    st.dataframe(requests_df(), width="stretch", hide_index=True)
-
-
-# ---------------- helpers for result display ----------------
-def gantt(result):
-    fig, ax = plt.subplots(figsize=(10, 1.0 + 0.6 * result.workers))
-    cmap = plt.cm.viridis
-    for t in result.txns:
-        if t.start_time < 0:
+    for item in items:
+        if item is None:
             continue
-        ax.barh(t.worker, t.finish_time - t.start_time, left=t.start_time,
-                color=cmap((t.base_priority - 1) / 4), edgecolor="white",
-                hatch="//" if t.status == "FAILED" else None)
-        ax.text(t.start_time + (t.finish_time - t.start_time) / 2, t.worker, t.txn_id,
-                ha="center", va="center", fontsize=6, color="white")
-    ax.set_yticks(range(result.workers))
-    ax.set_yticklabels([f"Worker {i}" for i in range(result.workers)])
-    ax.set_xlabel("logical time (ticks)")
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(1, 5))
-    fig.colorbar(sm, ax=ax, label="base priority", pad=0.01)
-    fig.tight_layout()
-    return fig
+
+        txn_id = getattr(item, "txn_id", None)
+
+        if txn_id is not None:
+            ids.append(str(txn_id))
+
+    st.session_state["new_txn_ids"] = list(dict.fromkeys(ids))
 
 
-def results_df(result):
-    return pd.DataFrame([{
-        "txn_id": t.txn_id, "type": t.txn_type, "src": t.src, "dst": t.dst,
-        "amount": t.amount, "base_prio": t.base_priority,
-        "eff_prio@dispatch": t.dispatch_priority, "arrival": t.arrival_time,
-        "start": t.start_time, "finish": t.finish_time, "waited": t.waiting_time,
-        "worker": t.worker, "blocked_times": t.blocked_count,
-        "status": t.status, "note": t.note} for t in result.txns])
+def get_value(row, *names, default=None):
+    """Read a value using the first available dictionary key."""
+
+    for name in names:
+        if isinstance(row, dict) and name in row:
+            return row[name]
+
+    return default
 
 
-# ---------------- tab 2: run ----------------
-with tab_run:
-    if st.button("Run scheduler", type="primary"):
-        reqs = repo.load_queued_requests()
-        if not reqs:
-            st.warning("No queued requests in Oracle. Add requests in tab 1.")
-        else:
-            initial_balances = repo.load_balances()
-            admission = repo.make_banker_admission(reqs) if use_banker else None
-            res = simulate(reqs, initial_balances, Scheduler(policy, aging), workers,
-                           admission=admission)
-            repo.persist_run(res, initial_balances)
-            st.session_state["result"] = res
-            st.success("Run results, account balances, ledger entries, and lifecycle events saved to Oracle.")
-
-    res = st.session_state.get("result")
-    if res:
-        m = compute_metrics(res, starve_thr)
-        st.subheader(f"Result: {POLICY_LABELS[Policy(res.policy)]}, {res.workers} worker(s)")
-        cols = st.columns(6)
-        cols[0].metric("Completed / Failed", f"{m['completed']} / {m['failed']}")
-        cols[1].metric("Avg wait", m["avg_wait"])
-        cols[2].metric("Max wait", m["max_wait"])
-        cols[3].metric("Avg turnaround", m["avg_turnaround"])
-        cols[4].metric("Throughput (txn/tick)", m["throughput"])
-        cols[5].metric(f"Waited > {starve_thr}", m["starved"])
-        st.caption("Avg wait by base priority: " +
-                   ", ".join(f"P{p}: {w}" for p, w in m["avg_wait_by_priority"].items()))
-        st.subheader("Process scheduling Gantt chart")
-        st.pyplot(gantt(res))
-        result_table = results_df(res)
-        st.subheader("Full transaction execution table")
-        st.dataframe(result_table, width="stretch", hide_index=True)
-        st.subheader("Lifecycle events — queue, block, wake-up, dispatch, completion/failure")
-        event_df = pd.DataFrame(res.events)
-        st.dataframe(event_df, width="stretch", hide_index=True)
-        if not event_df.empty:
-            counts = event_df.groupby("event").size().sort_values(ascending=False)
-            st.subheader("Scheduler event counts")
-            st.bar_chart(counts)
-        st.subheader("Priority and waiting-time analysis")
-        priority_df = result_table[["txn_id", "base_prio", "eff_prio@dispatch", "waited", "status"]].copy()
-        st.dataframe(priority_df, width="stretch", hide_index=True)
-        if not priority_df.empty:
-            st.bar_chart(priority_df.set_index("txn_id")[["base_prio", "eff_prio@dispatch", "waited"]])
-        with st.expander("Balances after this run (persisted to Oracle)"):
-            st.dataframe(pd.DataFrame({"account": list(res.balances),
-                                       "balance": list(res.balances.values())}),
-                         hide_index=True)
-    else:
-        st.info("Press **Run scheduler** to process the queued requests.")
+def get_transaction_id(row):
+    return str(get_value(
+        row, "transaction_id", "txn_id", default=""
+    ))
 
 
-# ---------------- tab 3: compare ----------------
-with tab_cmp:
-    st.write("Replays the same queued Oracle requests under all three policies. Comparison runs are simulations only and are not saved as executed transactions.")
-    if st.button("Compare FIFO vs Priority vs Priority + Aging"):
-        reqs = repo.load_queued_requests()
-        if not reqs:
-            st.warning("No requests yet.")
-        else:
-            bal = repo.load_balances()
-            rows = []
-            for p in Policy:
-                r = simulate(reqs, bal, Scheduler(p, aging), workers)
-                m = compute_metrics(r, starve_thr)
-                low = [t.waiting_time for t in r.txns if t.base_priority == min(x.base_priority for x in reqs)]
-                rows.append({"policy": POLICY_LABELS[p], "avg_wait": m["avg_wait"],
-                             "max_wait": m["max_wait"], "avg_turnaround": m["avg_turnaround"],
-                             "throughput": m["throughput"], "makespan": m["makespan"],
-                             f"waited>{starve_thr}": m["starved"],
-                             "lowest-priority max wait": max(low, default=0)})
-            df = pd.DataFrame(rows)
-            st.dataframe(df, width="stretch", hide_index=True)
-            st.bar_chart(df.set_index("policy")[["avg_wait", "max_wait", "lowest-priority max wait"]])
+def remember_queue_difference(before_ids):
+    """Find newly inserted queued requests, even if add_request returns None."""
+
+    after = repo.load_queued_requests()
+
+    new_items = [
+        txn for txn in after
+        if str(txn.txn_id) not in before_ids
+    ]
+
+    remember_new_transactions(new_items)
 
 
-# ---------------- tab 4: live Oracle records ----------------
-with tab_acc:
-    st.subheader("Oracle connection")
-    connection_message = repo.connection_status()
-    if connection_message == "Connected":
-        st.success("Connected to Oracle")
-    else:
-        st.error(connection_message)
+# =====================================================
+# 6. ADD TRANSACTION AND GENERATE LOAD
+# =====================================================
 
-    left, right = st.columns(2)
-    with left:
-        st.subheader("Users")
-        st.dataframe(pd.DataFrame(repo.load_users()), width="stretch", hide_index=True)
-    with right:
-        st.subheader("Accounts and persisted balances")
-        account_rows = [{"account_id": account_id, **details}
-                        for account_id, details in repo.load_accounts().items()]
-        st.dataframe(pd.DataFrame(account_rows), width="stretch", hide_index=True)
+left, right = st.columns([1.15, 0.85], gap="large")
 
-    st.subheader("Transaction history with user/account details (JOIN / transaction_history_v)")
-    try:
-        st.dataframe(pd.DataFrame(repo.load_transaction_history()), width="stretch", hide_index=True)
-    except Exception as exc:
-        st.error(f"Could not load joined transaction history: {exc}")
 
-    st.subheader("Pending request view (pending_transactions_v)")
-    try:
-        st.dataframe(pd.DataFrame(repo.load_pending_view()), width="stretch", hide_index=True)
-    except Exception as exc:
-        st.error(f"Could not load pending view: {exc}")
+# -------------------- ADD TRANSACTION --------------------
 
-    st.subheader("Transactions from Oracle")
-    all_transactions = repo.load_requests()
-    transaction_rows = [{
-        "txn_id": t.txn_id, "user": t.user_id, "type": t.txn_type, "src": t.src,
-        "dst": t.dst, "amount": t.amount, "base_priority": t.base_priority,
-        "effective_priority": t.dispatch_priority, "arrival": t.arrival_time,
-        "start": t.start_time, "finish": t.finish_time, "waiting": t.waiting_time,
-        "worker": t.worker, "blocked_count": t.blocked_count, "status": t.status,
-        "notes": t.note
-    } for t in all_transactions]
-    txn_df = pd.DataFrame(transaction_rows)
-    if not txn_df.empty:
-        selected_status = st.multiselect("Filter by status", sorted(txn_df["status"].dropna().unique()),
-                                         default=sorted(txn_df["status"].dropna().unique()))
-        txn_df = txn_df[txn_df["status"].isin(selected_status)]
-        search_id = st.text_input("Search transaction ID")
-        if search_id:
-            txn_df = txn_df[txn_df["txn_id"].str.contains(search_id, case=False, na=False)]
-    st.dataframe(txn_df, width="stretch", hide_index=True)
+with left:
 
-    with st.expander("Resource types and Banker claims"):
-        try:
-            resource_totals, claims, resource_names = repo.load_resource_totals_and_claims(all_transactions)
-            st.dataframe(pd.DataFrame([
-                {"resource": name, "total_units": resource_totals[i]}
-                for i, name in enumerate(resource_names)
-            ]), width="stretch", hide_index=True)
-            st.caption("Claims stored in TRANSACTION_RESOURCES are used when present. For transactions without explicit claims, the optional admission check derives ACCOUNT_RESOURCE claims from the number of account locks.")
-            claim_rows = []
-            for txn_id, vector in claims.items():
-                claim_rows.append({"transaction_id": txn_id, **{
-                    resource_names[i]: vector[i] for i in range(len(resource_names))
-                }})
-            st.dataframe(pd.DataFrame(claim_rows), width="stretch", hide_index=True)
-        except Exception as exc:
-            st.error(f"Could not load resource matrix: {exc}")
+    with st.container(border=True):
 
-    with st.expander("Ledger entries"):
-        st.dataframe(pd.DataFrame(repo.load_ledger()), width="stretch", hide_index=True)
-    with st.expander("Persistent audit / event history"):
-        st.dataframe(pd.DataFrame(repo.load_events()), width="stretch", hide_index=True)
-    with st.expander("Database status-change audit (trigger-backed)"):
-        try:
-            st.dataframe(pd.DataFrame(repo.load_status_audit()), width="stretch", hide_index=True)
-        except Exception as exc:
-            st.error(f"Could not load status audit: {exc}")
+        st.markdown(
+            '<div class="section-label">01 · Banking operation</div>',
+            unsafe_allow_html=True
+        )
 
-    with st.expander("DBMS operations covered"):
+        st.subheader("Add transaction")
+
+        types = ["DEPOSIT", "WITHDRAW", "BALANCE"]
+
+        if len(account_ids) > 1:
+            types.append("TRANSFER")
+
+        st.markdown(
+            '<div class="field-label">Transaction type</div>',
+            unsafe_allow_html=True
+        )
+
+        kind = st.selectbox(
+            "Transaction type",
+            types,
+            key="txn_kind",
+            label_visibility="collapsed"
+        )
+
+        with st.form("add_transaction"):
+
+            src = ""
+            dst = ""
+
+            # Source account
+
+            if kind in ("WITHDRAW", "TRANSFER", "BALANCE"):
+
+                st.markdown(
+                    '<div class="field-label">From account</div>',
+                    unsafe_allow_html=True
+                )
+
+                src = st.selectbox(
+                    "From account",
+                    account_ids,
+                    format_func=lambda a:
+                        f"{a} — {accounts[a]['holder']}",
+                    label_visibility="collapsed"
+                )
+
+            # Destination account
+
+            if kind in ("DEPOSIT", "TRANSFER"):
+
+                st.markdown(
+                    '<div class="field-label">To account</div>',
+                    unsafe_allow_html=True
+                )
+
+                choices = (
+                    [a for a in account_ids if a != src]
+                    if kind == "TRANSFER"
+                    else account_ids
+                )
+
+                dst = st.selectbox(
+                    "To account",
+                    choices,
+                    format_func=lambda a:
+                        f"{a} — {accounts[a]['holder']}",
+                    label_visibility="collapsed"
+                )
+
+            # Amount
+
+            if kind != "BALANCE":
+
+                st.markdown(
+                    '<div class="field-label">Amount (₹)</div>',
+                    unsafe_allow_html=True
+                )
+
+                amount = st.number_input(
+                    "Amount",
+                    min_value=100.0,
+                    value=100.0,
+                    step=100.0,
+                    label_visibility="collapsed"
+                )
+
+                st.caption(
+                    "Use + or − to change the amount in ₹100 steps."
+                )
+
+            else:
+                amount = 0
+
+            submitted = st.form_submit_button(
+                "＋ Add transaction to queue",
+                use_container_width=True
+            )
+
+            if submitted:
+
+                try:
+                    before_ids = {
+                        str(t.txn_id)
+                        for t in repo.load_queued_requests()
+                    }
+
+                    repo.add_request({
+                        "txn_type": kind,
+                        "src": src,
+                        "dst": dst,
+                        "amount": amount,
+                        "base_priority": 1,
+                        "arrival_time": 0,
+                        "duration": 1
+                    })
+
+                    remember_queue_difference(before_ids)
+
+                    st.success("Transaction added successfully!")
+                    st.rerun()
+
+                except Exception as exc:
+                    st.error(str(exc))
+
+
+# -------------------- GENERATE LOAD --------------------
+
+with right:
+
+    with st.container(border=True):
+
+        st.markdown(
+            '<div class="section-label">02 · Testing</div>',
+            unsafe_allow_html=True
+        )
+
+        st.subheader("Generate load")
+
+        st.write(
+            "Create sample banking transactions automatically "
+            "to test the scheduling algorithm."
+        )
+
+        with st.form("generate_load"):
+
+            st.markdown(
+                '<div class="field-label">Number of transactions</div>',
+                unsafe_allow_html=True
+            )
+
+            count = st.number_input(
+                "Number of transactions",
+                min_value=1,
+                max_value=30,
+                value=5,
+                step=1,
+                label_visibility="collapsed"
+            )
+
+            make_load = st.form_submit_button(
+                "⚡ Generate sample load",
+                use_container_width=True
+            )
+
+            if make_load:
+
+                try:
+                    before_ids = {
+                        str(t.txn_id)
+                        for t in repo.load_queued_requests()
+                    }
+
+                    made = generate_workload(repo, int(count))
+
+                    remember_new_transactions(made)
+
+                    # Also detect inserted transactions in case
+                    # the generator does not return all objects.
+                    remember_queue_difference(before_ids)
+
+                    mix = {}
+
+                    for txn in made:
+                        mix[txn.txn_type] = (
+                            mix.get(txn.txn_type, 0) + 1
+                        )
+
+                    st.session_state["last_generated_mix"] = mix
+
+                    st.success(
+                        f"{len(made)} sample transactions generated!"
+                    )
+
+                    st.rerun()
+
+                except Exception as exc:
+                    st.error(str(exc))
+
+        # Explain automatic aging
+
+        st.markdown("---")
+
         st.markdown("""
-        - **INSERT:** generated requests are registered in `TRANSACTIONS` with a `REGISTERED` event.
-        - **UPDATE:** scheduler status, effective priority, start/finish times, wait time, worker and blocked count are persisted.
-        - **SELECT / search / JOIN:** transaction filters plus joined user/account history are displayed above.
-        - **Views:** `TRANSACTION_HISTORY_V` and `PENDING_TRANSACTIONS_V`.
-        - **Constraints / keys / indexes:** primary keys, foreign keys, amount/account/status checks and query indexes are defined in the schema.
-        - **Atomicity:** successful balance changes, ledger rows, statuses and lifecycle events commit together; failures roll back.
-        - **Audit:** `EVENT_LOG` stores lifecycle events; `TRANSACTION_STATUS_AUDIT` records status changes via a database trigger.
-        """)
-        with st.expander("SQL examples for viva / DBMS demonstration"):
-            st.code("""-- INSERT example (use unique IDs and valid account/user references)
-INSERT INTO transactions
-    (transaction_id, seq_no, user_id, transaction_type, destination_account_id,
-     amount, base_priority, arrival_time, duration, transaction_status,
-     effective_priority, blocked_count)
-VALUES
-    (:transaction_id, :seq_no, :user_id, 'DEPOSIT', :destination_account_id,
-     :amount, 3, 0, 2, 'QUEUED', 0, 0);
+        <div style="
+            background:#eaf5ff;
+            padding:14px;
+            border-radius:10px;
+            color:#28547a;
+            font-size:13px;
+        ">
+            <b>Automatic priority aging</b><br>
+            Every transaction starts at priority 1. While it waits,
+            it gains 1 priority point after each completed transaction.
+            Maximum priority: <b>5</b>.
+        </div>
+        """, unsafe_allow_html=True)
 
--- UPDATE example (the application updates these execution fields after scheduling)
-UPDATE transactions
-SET notes = :notes, updated_at = SYSTIMESTAMP
-WHERE transaction_id = :transaction_id;
 
--- Retrieve and search transactions
-SELECT transaction_id, transaction_type, amount, transaction_status
-FROM transactions
-WHERE transaction_status IN ('QUEUED', 'BLOCKED')
-ORDER BY arrival_time, seq_no;
+# =====================================================
+# 7. GENERATED LOAD SUMMARY
+# =====================================================
 
--- Join transactions with users and account owners
-SELECT t.transaction_id, u.user_name, t.transaction_type,
-       t.source_account_id, su.user_name AS source_owner,
-       t.destination_account_id, du.user_name AS destination_owner,
-       t.amount, t.transaction_status
-FROM transactions t
-JOIN users u ON u.user_id = t.user_id
-LEFT JOIN accounts sa ON sa.account_id = t.source_account_id
-LEFT JOIN users su ON su.user_id = sa.user_id
-LEFT JOIN accounts da ON da.account_id = t.destination_account_id
-LEFT JOIN users du ON du.user_id = da.user_id
-ORDER BY t.seq_no;
+mix = st.session_state["last_generated_mix"]
 
--- Views and audit
-SELECT * FROM transaction_history_v;
-SELECT * FROM pending_transactions_v;
-SELECT * FROM ledger ORDER BY created_at DESC;
-SELECT * FROM event_log ORDER BY event_time DESC;
-SELECT * FROM transaction_status_audit ORDER BY changed_at DESC;""", language="sql")
-    st.warning("Reset sample accounts changes account balances. Use it only when you intentionally want to reset the demo balances.")
-    if st.button("Reset sample account balances"):
-        repo.reset_accounts()
-        st.success("Demo balances reset in Oracle.")
-        st.rerun()
+if mix:
+
+    st.markdown("---")
+    st.subheader("Last generated load")
+
+    st.caption(
+        "This shows the types of transactions created by your last Generate Load action."
+    )
+
+    cols = st.columns(len(mix))
+
+    for col, (kind, total) in zip(cols, mix.items()):
+        col.metric(kind, total)
+
+
+# =====================================================
+# 8. WAITING TRANSACTION QUEUE
+# =====================================================
+
+st.markdown("---")
+
+st.markdown(
+    '<div class="section-label">03 · Transaction management</div>',
+    unsafe_allow_html=True
+)
+
+st.subheader("Waiting transactions")
+
+queued = repo.load_queued_requests()
+
+if queued:
+
+    st.dataframe(
+        pd.DataFrame([{
+            "Transaction ID": t.txn_id,
+            "Type": t.txn_type,
+            "From": t.src or "—",
+            "To": t.dst or "—",
+            "Amount (₹)": t.amount,
+            "Base priority": t.base_priority
+        } for t in queued]),
+        hide_index=True,
+        use_container_width=True
+    )
+
+    st.write("")
+
+    if st.button(
+        "▶ Run Banker's Algorithm",
+        type="primary",
+        use_container_width=True
+    ):
+
+        try:
+            totals, claims, _ = (
+                repo.load_resource_totals_and_claims(queued)
+            )
+
+            before = repo.load_balances()
+
+            result = run_transactions(
+                queued,
+                before,
+                totals,
+                claims,
+                scheduler
+            )
+
+            if not result.safe:
+
+                st.error(
+                    "Unsafe state. No transaction was executed. "
+                    + result.message
+                )
+
+            else:
+
+                repo.persist_run(result, before)
+
+                st.session_state["last_sequence"] = " → ".join(
+                    x["txn_id"] for x in result.sequence
+                )
+
+                st.success("Transactions processed!")
+                st.rerun()
+
+        except Exception as exc:
+            st.error(f"Execution failed: {exc}")
+
+else:
+
+    st.info(
+        "Your transaction queue is empty. Add a transaction "
+        "or generate a sample load."
+    )
+
+
+# =====================================================
+# 9. LAST EXECUTED SAFE SEQUENCE
+# =====================================================
+
+if st.session_state["last_sequence"]:
+
+    st.markdown("---")
+    st.subheader("Last executed safe sequence")
+
+    st.markdown(
+        f"""
+        <div style="
+            background:linear-gradient(100deg,#e4f5f5,#eaf2ff);
+            padding:18px;
+            border-radius:12px;
+            border-left:5px solid #087e8b;
+            color:#173b68;
+            font-weight:700;
+            font-size:15px;
+        ">
+            {st.session_state["last_sequence"]}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =====================================================
+# 10. TRANSACTION HISTORY
+# =====================================================
+
+st.markdown("---")
+
+st.markdown(
+    '<div class="section-label">04 · Results</div>',
+    unsafe_allow_html=True
+)
+
+st.subheader("Transaction history")
+
+try:
+
+    history = repo.load_transaction_history()
+    ledger = repo.load_ledger()
+
+    ledger_by_txn = {}
+
+    for entry in ledger:
+
+        tid = str(entry["transaction_id"])
+
+        ledger_by_txn.setdefault(tid, []).append(entry)
+
+    rows = []
+
+    for txn in history:
+
+        tid = get_transaction_id(txn)
+
+        entries = ledger_by_txn.get(tid, [])
+
+        changes = []
+
+        for entry in entries:
+
+            account = entry["account_id"]
+            amount = float(entry["amount"])
+            after = float(entry["balance_after"])
+            entry_type = entry["entry_type"]
+
+            if entry_type in ("WITHDRAWAL", "TRANSFER_OUT"):
+
+                before = after + amount
+                sign = "-"
+
+            else:
+
+                before = after - amount
+                sign = "+"
+
+            changes.append(
+                f"{account}: ₹{before:,.2f} → "
+                f"₹{after:,.2f} ({sign}₹{amount:,.2f})"
+            )
+
+        status = str(
+            get_value(txn, "status", default="UNKNOWN")
+        ).upper()
+
+        txn_type = str(
+            get_value(txn, "type", "txn_type", default="UNKNOWN")
+        ).upper()
+
+        if changes:
+
+            impact = " | ".join(changes)
+
+        elif status == "FAILED":
+
+            impact = "Not applied"
+
+        elif txn_type == "BALANCE" and status == "COMPLETED":
+
+            impact = "Balance checked; no money moved"
+
+        elif status == "QUEUED":
+
+            impact = "Waiting to execute"
+
+        elif status == "RUNNING":
+
+            impact = "Currently executing"
+
+        else:
+
+            impact = "No balance change recorded"
+
+        if status == "COMPLETED":
+            display_status = "✅ Completed"
+
+        elif status == "FAILED":
+            display_status = "❌ Failed"
+
+        elif status == "QUEUED":
+            display_status = "🕒 Waiting"
+
+        else:
+            display_status = status
+
+        base_priority = get_value(
+            txn, "base_priority", default="—"
+        )
+
+        effective_priority = get_value(
+            txn, "effective_priority",
+            "dispatch_priority",
+            default=None
+        )
+
+        if effective_priority is not None:
+            priority = f"{base_priority} → {effective_priority}"
+        else:
+            priority = str(base_priority)
+
+        rows.append({
+
+            "Transaction ID": tid,
+
+            "Created": str(get_value(
+                txn, "created_at", "arrival_time", default="—"
+            )),
+
+            "Type": txn_type,
+
+            "From account": get_value(
+                txn, "source_account", "src", default="—"
+            ) or "—",
+
+            "To account": get_value(
+                txn, "destination_account", "dst", default="—"
+            ) or "—",
+
+            "Amount": (
+                "—"
+                if txn_type == "BALANCE"
+                else f"₹{float(get_value(txn, 'amount', default=0)):,.2f}"
+            ),
+
+            "Status": display_status,
+
+            "Priority (base → effective)": priority,
+
+            "Balance changes": impact,
+
+            "Notes": get_value(
+                txn, "notes", "note", default="—"
+            ) or "—"
+        })
+
+    # Separate current-session transactions from older records.
+
+    new_ids = set(st.session_state["new_txn_ids"])
+
+    new_rows = [
+        row for row in rows
+        if row["Transaction ID"] in new_ids
+    ]
+
+    old_rows = [
+        row for row in rows
+        if row["Transaction ID"] not in new_ids
+    ]
+
+    # -------------------- NEW TRANSACTIONS --------------------
+
+    st.markdown("### 🟢 New transactions")
+
+    st.caption(
+        "Transactions added during your current app session, "
+        "including manually added and generated requests."
+    )
+
+    st.metric("New transactions", len(new_rows))
+
+    if new_rows:
+
+        st.dataframe(
+            pd.DataFrame(new_rows),
+            hide_index=True,
+            use_container_width=True
+        )
+
+    else:
+
+        st.info(
+            "No new transactions yet. Add a transaction "
+            "or generate a load."
+        )
+
+    # -------------------- PREVIOUS TRANSACTIONS --------------------
+
+    st.markdown("### 📁 Previous transactions")
+
+    st.caption(
+        "Transactions already stored in Oracle before "
+        "your current app session."
+    )
+
+    with st.expander(
+        f"View previous transactions ({len(old_rows)})",
+        expanded=False
+    ):
+
+        if old_rows:
+
+            st.dataframe(
+                pd.DataFrame(old_rows),
+                hide_index=True,
+                use_container_width=True
+            )
+
+        else:
+
+            st.info("No previous transactions found.")
+
+except Exception as exc:
+
+    st.warning(
+        f"Could not load transaction history: {exc}"
+    )
+
+
+# =====================================================
+# 11. CURRENT ACCOUNT BALANCES
+# =====================================================
+
+st.markdown("---")
+
+st.subheader("Current account balances")
+
+try:
+
+    current = repo.load_accounts()
+
+    st.dataframe(
+        pd.DataFrame([{
+            "Account ID": account,
+            "Account holder": details["holder"],
+            "Available balance (₹)": details["balance"]
+        } for account, details in current.items()]),
+        hide_index=True,
+        use_container_width=True
+    )
+
+except Exception as exc:
+
+    st.warning(f"Could not load account balances: {exc}")
+
+
+# =====================================================
+# 12. FOOTER
+# =====================================================
+
+st.markdown("""
+<div style="
+    text-align:center;
+    color:#66809b;
+    font-size:12px;
+    padding:20px 0 5px 0;
+">
+    Bank Transaction Manager · Banker's Algorithm · Priority Aging
+</div>
+""", unsafe_allow_html=True)
